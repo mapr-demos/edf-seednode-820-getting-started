@@ -1,0 +1,1930 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+COMPONENT_DIR=$SCRIPT_DIR
+
+DEFAULT_IMAGE="docker.io/maprtech/edf-airgap-repository-container:latest"
+DEFAULT_CONTAINER_NAME="mapr-airgap-repository"
+DEFAULT_DATA_DIR="/var/lib/mapr-airgap-repository"
+DEFAULT_PORT=8080
+DATA_MARKER_NAME=.mapr-airgap-repository
+DATA_MARKER_SIGNATURE=managed-by=airgap-repository
+
+IMAGE=$DEFAULT_IMAGE
+CONTAINER_NAME=$DEFAULT_CONTAINER_NAME
+DATA_DIR=$DEFAULT_DATA_DIR
+PORT=$DEFAULT_PORT
+RUNTIME=auto
+CORE_VERSIONS=()
+CORE_OS=()
+MEP_VERSIONS=()
+MEP_OS=()
+INSTALLER_OS=()
+REPO_URL=
+REPO_URL_FILE=
+REPO_CONFIG_FILE=
+REPO_URL_STDIN=false
+ADVERTISE_HOST=
+CA_CERT=${AIRGAP_CA_CERT_FILE:-}
+MAPR_SETUP_FILE=
+MAPR_SETUP_URL=
+MAPR_SETUP_SHA256=
+UNSAFE_LOG_RAW_ARGV=false
+ACKNOWLEDGE_SECRET_EXPOSURE=false
+SKIP_DISK_SPACE_CHECK=false
+LOCAL_IMAGE=false
+BUILD_IMAGE=false
+DRY_RUN=false
+ASSUME_YES=false
+PORT_SET=false
+DATA_DIR_SET=false
+IMAGE_SET=false
+RUNTIME_REMOTE=false
+HTTP_PROXY_VALUE=${http_proxy:-${HTTP_PROXY:-}}
+HTTPS_PROXY_VALUE=${https_proxy:-${HTTPS_PROXY:-}}
+NO_PROXY_VALUE=${no_proxy:-${NO_PROXY:-}}
+HTTP_PROXY_SET=false
+HTTPS_PROXY_SET=false
+NO_PROXY_SET=false
+REPOSITORY_INPUT_TEMP=
+REPOSITORY_STDIN_TEMP_DIR=
+REPOSITORY_STDIN_FILE=
+REPOSITORY_STDIN_READER_PID=
+REPOSITORY_STDIN_READER_FD=
+NETWORK_CONFIG_TEMP=
+REPOSITORY_NORMALIZATION_TEMP=
+NETWORK_CONFIG_FILE=${AIRGAP_NETWORK_CONFIG_FILE:-}
+SERVING_RUNTIME_CONFIG_TEMP=
+SERVING_RUNTIME_COMMAND=()
+SERVING_RUNTIME_RUN_ARGS=()
+SERVING_ENV_ARGS=()
+SERVING_PROXY_ENV_NAMES=(http_proxy HTTP_PROXY https_proxy HTTPS_PROXY no_proxy NO_PROXY)
+
+usage() {
+    cat <<'USAGE'
+Usage: airgap-repository <command> [options]
+
+Image commands:
+  airgap-repository build       Build the generic runtime image
+  airgap-repository push        Publish the image to its registry
+
+Synchronization commands:
+  airgap-repository create      Create a serving container and synchronize packages
+  airgap-repository update      Synchronize packages using an existing serving container
+
+Container lifecycle and inspection:
+  airgap-repository start|stop|restart|status|print-url|remove [options]
+  airgap-repository purge-data --yes [options]  Permanently delete repository data
+
+Use airgap-repository <command> --help (or -h) for practical help and an example.
+Use airgap-repository <command> --help-full for complete options and documentation.
+Synchronization inputs apply to create/update; lifecycle needs no upstream credentials.
+For create/update, select at least one independent component:
+  Core: --core-versions VER [VER...] --core-os OS [OS...]
+  MEP: --mep-versions VER [VER...] --mep-os OS [OS...]
+  Installer: --installer-os OS [OS...]
+Core and MEP each require both options when selected; there is no automatic
+compatibility selection or pairing. Omitted components are not synchronized.
+remove preserves persistent data; purge-data permanently deletes it.
+Help requires no container runtime, network access, or credentials.
+USAGE
+}
+
+command_usage() {
+    case $1 in
+        build|push)
+            printf 'Usage: airgap-repository %s [options]\n\nRequired arguments: none.\n\n' "$1"
+            cat <<'USAGE'
+Image options:
+  --image IMAGE          Nonempty image reference; syntax checked by runtime
+                         Default: docker.io/maprtech/edf-airgap-repository-container:latest
+USAGE
+            if [[ $1 == build ]]; then
+                cat <<'USAGE'
+
+Prerequisites and effects:
+  Requires the component build files and an accessible container runtime.
+  Builds a generic Ubuntu/nginx image using a temporary minimal build context.
+  Requires access to base-image and OS package sources (or available caches).
+  Does not synchronize product packages or include mapr-setup.sh in the image.
+  The image is tagged locally; building does not push it to a registry.
+
+Example:
+  airgap-repository build --runtime docker
+USAGE
+            else
+                cat <<'USAGE'
+
+Prerequisites and effects:
+  Requires an accessible container runtime and the named local image.
+  Publishes that image to its registry; requires registry network access and
+  any necessary registry login/permission configured in the container runtime.
+  Does not build the image or synchronize product packages.
+
+Example:
+  airgap-repository push --runtime docker
+USAGE
+            fi
+            cat <<'USAGE'
+
+Incompatibilities:
+  Repository URL, downloader, disk-space, and unsafe argv options are rejected
+  for build/push; they apply only to create/update synchronization.
+USAGE
+            ;;
+        create|update)
+            printf 'Usage: airgap-repository %s \\\n' "$1"
+            cat <<'USAGE'
+  [--core-versions VER [VER...] --core-os OS [OS...]] \
+  [--mep-versions VER [VER...] --mep-os OS [OS...]] \
+  [--installer-os OS [OS...]] \
+  (--repo-url URL | --repo-url-file PATH | --repo-config-file PATH | --repo-url-stdin) \
+  [options]
+
+Required synchronization arguments (no defaults):
+  Select at least one component: Core, MEP, or Installer, independently.
+  Core requires both --core-versions and --core-os; MEP requires both
+  --mep-versions and --mep-os. Partial pairs fail. Installer requires --installer-os.
+  No compatibility inference or mandatory Core/MEP pairing is performed.
+  Omitted components are not synchronized; update preserves published branches.
+
+Component selection options (no defaults):
+  --core-versions VER [VER...]  Core/Data Fabric versions, X.Y.Z (vX.Y.Z accepted)
+  --core-os OS [OS...]         Values: redhat, rhel9, ubuntu, ubuntu22, ubuntu24,
+                              suse, suse15.5
+  --mep-versions VER [VER...]   MEP versions, X.Y.Z (vX.Y.Z accepted)
+  --mep-os OS [OS...]          Values: redhat, ubuntu, suse
+  --installer-os OS [OS...]    Values: redhat, ubuntu, suse
+
+Required repository source:
+  Exactly one repository source:
+  --repo-url URL               Credential-free HTTP(S) package repository root;
+                              no query string or fragment
+  --repo-url-file PATH         Absolute protected file containing one repository URL
+  --repo-config-file PATH      Absolute protected KEY=VALUE configuration;
+                              keys required once: repository_url, username, password
+  --repo-url-stdin             Read exactly one nonempty URL from nonterminal stdin
+
+Optional synchronization arguments:
+  --mapr-setup-file PATH       Local downloader override; absolute readable,
+                              nonempty regular file, not a symlink;
+                              path must contain no tab, CR or LF
+  --mapr-setup-url URL         Credential-free HTTP(S) downloader override;
+                              no @ character, query string or fragment
+  --mapr-setup-sha256 SHA256   Exact checksum pin: 64 hexadecimal characters
+                              Default: no checksum pin
+  --http-proxy URL             Helper-only HTTP(S) proxy
+  --https-proxy URL            Helper-only HTTP(S) proxy
+  --no-proxy LIST              Helper-only comma-separated proxy bypass list
+                              Defaults: lowercase/uppercase host proxy variables;
+                              bypass also includes mirror host and loopback
+  --network-config-file PATH   Protected helper proxy configuration; supports
+                              http_proxy, https_proxy, no_proxy and uppercase keys
+                              Default: AIRGAP_NETWORK_CONFIG_FILE, otherwise none
+  --ca-cert PATH               Readable, nonempty CA file, not a symlink;
+                              mounted only into helpers
+                              Default: AIRGAP_CA_CERT_FILE, otherwise none
+  --skip-disk-space-check      DEV/TEST: skip synchronization capacity preflight;
+                              other validation still runs (default: check space)
+  --unsafe-log-raw-argv        UNSAFE: log exact downloader argv; credentials,
+                              tokens and paths may be exposed (default: sanitized)
+  --acknowledge-secret-exposure Required together with --unsafe-log-raw-argv
+
+Component value requirements:
+  OS lists above describe published build targets, not every parser-recognized input.
+  Core also supports ubuntu24 for any syntactically valid Core version.
+  Actual archive availability depends on the upstream repository.
+  ubuntu24 is not supported for MEP or Installer.
+  Values are space-separated; OS inputs are case-insensitive.
+  Versions/selectors have no automatic selection defaults; duplicates after
+  normalization are rejected. Versions contain three numeric dot-separated parts.
+
+Publication behavior:
+  Core-only and MEP-only repositories may exist without pub/; it is optional.
+  Installer is recommended when signing keys from its archive are required for
+  normal deployment. Omitting Installer on update preserves existing pub/ content.
+  Synchronization preserves cumulative publication semantics and atomically
+  commits successful generations, including previously published components.
+
+Repository and downloader requirements:
+  Use the package repository root, without a query string or fragment.
+  Do not append /installer/ubuntu/mapr-setup.sh to the repository root.
+  Protected repository/proxy files must be absolute, readable, nonempty regular
+  files, not symlinks, with no group/other permissions (e.g. mode 0600).
+  URL files/stdin may contain encoded credentials; prefer --repo-config-file.
+  Credential-bearing proxies require --network-config-file.
+  Package repository URL and mapr-setup.sh source can differ.
+  Default downloader: <repository-root>/installer/ubuntu/mapr-setup.sh,
+  retrieved at sync time and cached; it must support component-specific download
+  arguments. Upstream access and authentication are required as applicable.
+
+Incompatibilities:
+  Repository sources are mutually exclusive.
+  --mapr-setup-file and --mapr-setup-url are mutually exclusive.
+  --network-config-file (including its environment default) cannot be combined
+  with explicit --http-proxy, --https-proxy or --no-proxy.
+  --unsafe-log-raw-argv and --acknowledge-secret-exposure require each other.
+
+Container options (separate from synchronization inputs):
+  --container-name NAME        Exact name (default: mapr-airgap-repository);
+                              pattern: [A-Za-z0-9][A-Za-z0-9_.-]+ (2+ characters)
+  --advertise-host HOST        Hostname/IP only, no scheme/path/port; auto-discovered
+                              locally, required for remote runtimes. Character
+                              pattern: \[?[A-Za-z0-9:.%_-]+\]?
+USAGE
+            if [[ $1 == create ]]; then
+                cat <<'USAGE'
+  --data-dir PATH              Canonical absolute host data directory, no symlinks
+                              Default: /var/lib/mapr-airgap-repository
+  --port PORT                  Host HTTP port, 1..65535 (default: 8080)
+  --image IMAGE                Nonempty reference; syntax checked by runtime
+                              Default: docker.io/maprtech/edf-airgap-repository-container:latest
+  --local                      Require an existing local image instead of pulling
+  --build                      Build before create; implies --local and takes
+                              precedence when both flags are supplied
+                              Default image action: pull
+
+Prerequisites and effects:
+  Requires an accessible runtime, unused container name/port and writable storage.
+  Existing storage must be empty or carry a valid repository ownership marker;
+  nested mounts are rejected. Creates the directory/marker when needed.
+  Starts an HTTP serving container with restart policy unless-stopped, then runs
+  a temporary synchronization helper and waits for repository health.
+  Synchronization publishes requested branches and optional downloader-provided
+  pub/ content, preserving existing branches in reused storage. Existing pub/
+  files are preserved unless Installer is explicitly selected. Removes inactive
+  publication trees; archives/downloaders remain cached. Initial sync failure
+  preserves data and the created container for retry with update.
+
+Example:
+  airgap-repository create --local \
+    --core-versions 8.2.0 --core-os ubuntu22 \
+    --mep-versions 10.1.1 --mep-os ubuntu --installer-os ubuntu \
+    --repo-config-file /secure/repository.conf --advertise-host mirror.example.test
+USAGE
+            else
+                cat <<'USAGE'
+  --data-dir PATH              Default: existing container's /data source;
+                              explicit value must match that source
+  --image IMAGE                Nonempty helper image reference; runtime checks syntax
+                              Default: existing container's image
+                              Explicit override selects only the sync helper,
+                              without replacing the serving container
+  --port PORT                  Printed URL override; default: discovered existing
+                              mapping, falling back to 8080. Use numeric 1..65535;
+                              update does not validate the override range/format
+
+Prerequisites and effects:
+  Requires an existing, running, managed serving container and marked data storage.
+  Runs a temporary synchronization helper sharing the serving container's network.
+  Adds requested content cumulatively; existing publication remains available on
+  failure before publication. Each update may use a different repository root
+  and downloader source. Omitted components are preserved without synchronization.
+  Post-commit cleanup errors can leave the new
+  publication active. Deletes inactive publication trees; cached archives/downloaders are retained. Does not retain rollback trees.
+  Does not recreate the serving container or change its image, port or mount.
+  Does not explicitly pull or build an image; --local/--build have no effect here.
+
+Example:
+  airgap-repository update \
+    --core-versions 8.2.0 --core-os ubuntu24 \
+    --repo-config-file /secure/repository.conf --advertise-host mirror.example.test
+USAGE
+            fi
+            cat <<'USAGE'
+
+Dry-run limitation:
+  Synchronization dry-runs may create protected temporary files and inspect
+  runtime state; they do not execute synchronization or serving containers.
+USAGE
+            ;;
+        start|stop|restart|status|print-url|remove|purge-data)
+            if [[ $1 == purge-data ]]; then
+                cat <<'USAGE'
+Usage: airgap-repository purge-data --yes [options]
+
+Required argument:
+  --yes                       Confirm permanent deletion; no interactive prompt
+USAGE
+            else
+                printf 'Usage: airgap-repository %s [options]\n\nRequired arguments: none.\n' "$1"
+            fi
+            cat <<'USAGE'
+
+Container options:
+  --container-name NAME       Exact name (default: mapr-airgap-repository)
+USAGE
+            case $1 in
+                start|restart|status|print-url)
+                    cat <<'USAGE'
+  --advertise-host HOST       Hostname/IP for the printed HTTP URL; auto-discovered
+                             locally. Required for remote start/restart/print-url;
+                             status reports URL unavailable if it cannot discover it
+  --port PORT                 Printed URL override; default: existing mapping,
+                             falling back to 8080. Does not change port binding.
+                             Use numeric 1..65535; only print-url validates it
+USAGE
+                    ;;
+                remove)
+                    cat <<'USAGE'
+  --data-dir PATH             Default: existing container's /data source;
+                             explicit value must match that source
+USAGE
+                    ;;
+                purge-data)
+                    cat <<'USAGE'
+  --data-dir PATH             Canonical absolute directory to delete
+                             Default: /var/lib/mapr-airgap-repository
+USAGE
+                    ;;
+            esac
+            printf '\nPrerequisites and effects:\n'
+            case $1 in
+                start)
+                    cat <<'USAGE'
+  Requires an existing managed container and an accessible runtime.
+  Starts it, waits for repository health, and prints its HTTP URL.
+  Preserves data; does not synchronize packages or recreate the container.
+USAGE
+                    ;;
+                stop)
+                    cat <<'USAGE'
+  Requires an existing managed container and an accessible runtime.
+  Stops HTTP serving; preserves the container and persistent data.
+USAGE
+                    ;;
+                restart)
+                    cat <<'USAGE'
+  Requires an existing managed container and an accessible runtime.
+  Restarts HTTP serving (brief interruption), waits for health, and prints its URL.
+  Preserves data; does not synchronize packages or recreate the container.
+USAGE
+                    ;;
+                status)
+                    cat <<'USAGE'
+  Requires an accessible runtime; an existing container must be managed.
+  Reads container state, health, image, port, URL, publication and storage usage.
+  If running, also reads repository status inside the container.
+  Returns nonzero when the container is absent. Does not change container/data.
+USAGE
+                    ;;
+                print-url)
+                    cat <<'USAGE'
+  Requires an existing, running, managed container and an accessible runtime.
+  Waits for repository health and prints its HTTP URL; preserves container/data.
+USAGE
+                    ;;
+                remove)
+                    cat <<'USAGE'
+  Requires an accessible runtime; an existing container must be managed.
+  DESTRUCTIVE to the container: forcibly removes it, stopping HTTP serving.
+  Persistent repository data and the image are preserved for reuse.
+  An absent container is a successful no-op. Use purge-data separately to delete data.
+USAGE
+                    ;;
+                purge-data)
+                    cat <<'USAGE'
+  DESTRUCTIVE: permanently deletes the entire data directory, including published
+  packages, cached archives/downloaders, staging, manifests, logs and marker.
+  No undo. Deletion is recursive; ensure the directory contains no nested mounts.
+  Requires an accessible runtime and removal of the named container first.
+  Refuses unsafe system paths, symlinks, noncanonical paths and missing/invalid
+  .mapr-airgap-repository marker (managed-by=airgap-repository).
+  An absent data directory is a successful no-op. Verify --data-dir carefully.
+USAGE
+                    ;;
+            esac
+            cat <<'USAGE'
+
+Incompatibilities:
+  Repository URL, downloader, disk-space and unsafe argv options are rejected;
+  they apply only to create/update. Synchronization selectors and helper proxy/CA
+  settings have no effect on these commands. No upstream credentials are needed.
+USAGE
+            printf '\nExample:\n'
+            if [[ $1 == purge-data ]]; then
+                cat <<'USAGE'
+  airgap-repository purge-data --yes --data-dir /var/lib/mapr-airgap-repository
+USAGE
+            else
+                printf '  airgap-repository %s --container-name mapr-airgap-repository\n' "$1"
+            fi
+            ;;
+        help|-h|--help) usage; return ;;
+        *) usage; return ;;
+    esac
+    cat <<'USAGE'
+
+Common optional arguments:
+  --runtime auto|docker|podman  Default: auto; AIRGAP_CONTAINER_ENGINE may select
+                               docker/podman, otherwise try Docker then Podman
+  --dry-run                    Display actions with command validation; may inspect
+                               runtime state. Default: execute
+  -h, --help                   Show this command help and exit successfully;
+                               no runtime, network, credentials or side effects
+USAGE
+}
+
+concise_command_usage() {
+    case $1 in
+        build|push|create|update|start|stop|restart|status|print-url|remove|purge-data) ;;
+        *) usage; return ;;
+    esac
+    if [[ $1 == purge-data ]]; then
+        printf 'Usage: airgap-repository purge-data --yes [options]\n'
+    else
+        printf 'Usage: airgap-repository %s [options]\n' "$1"
+    fi
+    case $1 in
+        build|push)
+            if [[ $1 == build ]]; then
+                printf 'Build the generic repository serving image locally.\n'
+            else
+                printf 'Push a local repository image to its registry.\n'
+            fi
+            cat <<'USAGE'
+
+Options:
+  --image IMAGE          Default: docker.io/maprtech/edf-airgap-repository-container:latest
+USAGE
+            ;;
+        create|update)
+            if [[ $1 == create ]]; then
+                printf 'Create a serving container and download selected packages.\n'
+            else
+                printf 'Add packages to an existing, running, managed repository container.\n'
+            fi
+            cat <<'USAGE'
+
+Required: select at least one independent component (no defaults):
+  --core-versions VER [VER...]  Core versions, X.Y.Z or vX.Y.Z
+  --core-os OS [OS...]          OS: redhat, rhel9, ubuntu, ubuntu22, ubuntu24,
+                                    suse, suse15.5
+  --mep-versions VER [VER...]   MEP versions, X.Y.Z or vX.Y.Z
+  --mep-os OS [OS...]           OS: redhat, ubuntu, suse
+  --installer-os OS [OS...]     Installer OS: redhat, ubuntu, suse
+  Core and MEP each require both their version and OS options.
+USAGE
+            if [[ $1 == create ]]; then
+                printf '  Omitted components are not synchronized.\n'
+            else
+                printf '  Omitted components retain existing published content without being synchronized again.\n'
+            fi
+            cat <<'USAGE'
+
+Required: exactly one repository source:
+  --repo-url URL          Credential-free HTTP(S) repository root
+  --repo-config-file PATH Protected config (preferred for credentials)
+  --repo-url-file PATH    Protected file containing one URL
+  --repo-url-stdin        Read one URL from nonterminal stdin
+
+Options:
+  --container-name NAME  Default: mapr-airgap-repository
+USAGE
+            if [[ $1 == create ]]; then
+                cat <<'USAGE'
+  --data-dir PATH        Default: /var/lib/mapr-airgap-repository (empty or managed storage)
+  --port PORT            HTTP port, 1..65535 (default: 8080)
+  --image IMAGE          Default: docker.io/maprtech/edf-airgap-repository-container:latest
+  --local                Use an existing local image (default: pull)
+  --build                Build first; implies --local (default: pull)
+USAGE
+            else
+                cat <<'USAGE'
+  --data-dir PATH        Default: container's /data source; override must match
+  --image IMAGE          Sync helper only (default: existing container's image)
+  --port PORT            Printed URL only (default: existing mapping, fallback 8080)
+USAGE
+            fi
+            cat <<'USAGE'
+  --advertise-host HOST  URL hostname/IP (default: auto locally; required remotely)
+  --mapr-setup-file PATH Local downloader override; exclusive with --mapr-setup-url
+  --mapr-setup-url URL   Credential-free downloader URL override
+  --network-config-file PATH
+                         Proxy config (default: AIRGAP_NETWORK_CONFIG_FILE, else none)
+  --ca-cert PATH         Helper CA (default: AIRGAP_CA_CERT_FILE, else none)
+USAGE
+            ;;
+        start|stop|restart|status|print-url|remove|purge-data)
+            case $1 in
+                start) printf 'Start an existing managed container, wait for health, and print its URL.\n' ;;
+                stop) printf 'Stop HTTP serving while preserving the container and persistent data.\n' ;;
+                restart) printf 'Restart an existing managed container, wait for health, and print its URL.\n' ;;
+                status) printf 'Show container state, health, image, URL, publication, and storage usage.\n' ;;
+                print-url) printf 'Print the HTTP URL of an existing, running, healthy managed container.\n' ;;
+                remove) printf 'Forcibly remove the serving container; persistent data and image are preserved.\n' ;;
+                purge-data)
+                    cat <<'USAGE'
+IRREVERSIBLE: permanently delete the entire repository data directory.
+
+Required:
+  --yes                 Confirm deletion without an interactive prompt
+USAGE
+                    ;;
+            esac
+            cat <<'USAGE'
+
+Options:
+  --container-name NAME  Default: mapr-airgap-repository
+USAGE
+            case $1 in
+                start|restart|status|print-url)
+                    cat <<'USAGE'
+  --advertise-host HOST  URL hostname/IP (default: auto locally)
+  --port PORT            Printed/reported URL only (default: existing mapping, else 8080)
+                         Does not change the container's actual port binding.
+USAGE
+                    if [[ $1 == print-url ]]; then
+                        printf '                         Validates numeric range 1..65535.\n'
+                    else
+                        printf '                         No numeric/range validation; only print-url validates 1..65535.\n'
+                    fi
+                    ;;
+                remove)
+                    printf "  --data-dir PATH        Default: container's /data source; override must match\n"
+                    ;;
+                purge-data)
+                    printf '  --data-dir PATH        Directory to delete (default: /var/lib/mapr-airgap-repository)\n'
+                    ;;
+            esac
+            ;;
+    esac
+    cat <<'USAGE'
+  --runtime auto|docker|podman  Default: auto; AIRGAP_CONTAINER_ENGINE, else Docker then Podman
+  --dry-run              Validate and preview (default: execute; may inspect runtime)
+  -h, --help             Show concise help
+USAGE
+    printf '\nExample:\n'
+    case $1 in
+        create|update)
+            printf '  airgap-repository %s --core-versions 8.2.0 --core-os ubuntu24 \\\n' "$1"
+            cat <<'USAGE'
+    --repo-config-file /secure/repository.conf --advertise-host mirror.example.test
+
+Warnings:
+  Use the repository root, without query/fragment, not an installer script URL.
+  Keep credentials in protected files or stdin; logging can expose sensitive information.
+USAGE
+            if [[ $1 == create ]]; then
+                printf '  Sync failure preserves container/data; retry with update.\n'
+                printf '  Select Installer if signing keys are needed.\n'
+            else
+                printf '  Serving container stays unchanged. Inactive publication trees are deleted;\n'
+                printf '  no rollback trees retained.\n'
+            fi
+            ;;
+        build)
+            cat <<'USAGE'
+  airgap-repository build --runtime docker
+
+Requires build files, a runtime, and base-image/package sources or caches.
+Builds locally; use push separately to publish. Product packages are not downloaded.
+USAGE
+            ;;
+        push)
+            cat <<'USAGE'
+  airgap-repository push --runtime docker
+
+Requires the local image, an accessible runtime, registry access and any registry login.
+Publishes the image to its registry; does not build it or download product packages.
+USAGE
+            ;;
+        purge-data)
+            cat <<'USAGE'
+  airgap-repository purge-data --yes --data-dir /var/lib/mapr-airgap-repository
+
+Warning: no undo. Deletes packages, caches, manifests, logs and repository marker.
+Remove the named container first. Verify --data-dir; it must be a managed directory
+with no symlinks or nested mounts. Requires an accessible runtime.
+USAGE
+            ;;
+        *)
+            printf '  airgap-repository %s --container-name mapr-airgap-repository\n' "$1"
+            case $1 in
+                start|restart)
+                    printf '\nRequires an accessible runtime; data is preserved. Set --advertise-host for remote runtimes.\n'
+                    if [[ $1 == restart ]]; then
+                        printf 'Warning: HTTP serving is briefly interrupted.\n'
+                    fi
+                    ;;
+                stop) printf '\nRequires an existing managed container and accessible runtime. HTTP serving stops.\n' ;;
+                status)
+                    printf '\nRequires an accessible runtime. Missing container returns nonzero; no state is changed.\n'
+                    printf 'If URL discovery fails, reports URL unavailable; use --advertise-host to supply a host.\n'
+                    ;;
+                print-url)
+                    printf '\nRequires an accessible runtime; waits for health without changing container/data.\n'
+                    printf 'Set --advertise-host for remote runtimes. --port changes output only, not port binding.\n'
+                    ;;
+                remove)
+                    printf '\nWarning: stops HTTP serving and removes the container. Persistent data and image are preserved.\n'
+                    printf 'Requires an accessible runtime. Absent container is a successful no-op.\n'
+                    ;;
+            esac
+            ;;
+    esac
+    printf '\nFull documentation: airgap-repository %s --help-full\n' "$1"
+}
+
+die() {
+    echo "ERROR: $*" >&2
+    exit 1
+}
+
+info() {
+    echo "INFO: $*"
+}
+
+render_command() {
+    local arg
+    printf '+'
+    for arg in "$@"; do
+        printf ' %q' "$arg"
+    done
+    printf '\n'
+}
+
+run_command() {
+    if [[ $DRY_RUN == true ]]; then
+        render_command "$@"
+        return 0
+    fi
+    "$@"
+}
+
+append_e2e_container_labels() {
+    local output_name=$1 run_id=${AIRGAP_E2E_RUN_ID:-}
+    local -n output_ref=$output_name
+    [[ -n $run_id ]] || return 0
+    [[ $run_id =~ ^[A-Za-z0-9_.-]+$ ]] ||
+        die "AIRGAP_E2E_RUN_ID contains unsupported characters"
+    output_ref+=(
+        --label com.hpe.airgap.e2e=true
+        --label "com.hpe.airgap.e2e.run-id=$run_id"
+        --label "com.hpe.airgap.e2e.preserved=${PRESERVE_E2E_STATE:-false}"
+    )
+}
+
+require_value() {
+    [[ $# -ge 2 && -n ${2:-} ]] || die "$1 requires a value"
+}
+
+normalize_version() {
+    local value=${1#v}
+    [[ $value =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "Invalid version '$1'; expected X.Y.Z"
+    printf '%s\n' "$value"
+}
+
+normalize_version_list() {
+    local input_name=$1 output_name=$2 option=$3 item normalized
+    local -n input_ref=$input_name output_ref=$output_name
+    local -A seen=()
+    output_ref=()
+    ((${#input_ref[@]} > 0)) || die "$option requires at least one value"
+    for item in "${input_ref[@]}"; do
+        [[ -n $item ]] || die "$option values must not be empty"
+        normalized=$(normalize_version "$item")
+        [[ -z ${seen[$normalized]:-} ]] || die "Duplicate version '$item' for $option"
+        output_ref+=("$normalized")
+        seen[$normalized]=1
+    done
+}
+
+normalize_component_os_list() {
+    local component=$1 input_name=$2 output_name=$3 option=$4 item normalized
+    local -n input_ref=$input_name output_ref=$output_name
+    local -A seen=()
+    output_ref=()
+    ((${#input_ref[@]} > 0)) || die "$option requires at least one value"
+    for item in "${input_ref[@]}"; do
+        [[ -n $item ]] || die "$option values must not be empty"
+        case ${item,,} in
+            rhel|rhel8|redhat) normalized=redhat ;;
+            rhel9) normalized=rhel9 ;;
+            ubuntu|ubuntu18) normalized=ubuntu ;;
+            ubuntu22) normalized=ubuntu22 ;;
+            ubuntu24)
+                [[ $component == Core ]] || die "Unsupported $component OS selector '$item'"
+                normalized=ubuntu24
+                ;;
+            suse|suse15) normalized=suse ;;
+            suse15.5) normalized=suse15.5 ;;
+            *) die "Unsupported $component OS selector '$item'" ;;
+        esac
+        [[ -z ${seen[$normalized]:-} ]] || die "Duplicate $component OS selector '$item' resolves to '$normalized'"
+        output_ref+=("$normalized")
+        seen[$normalized]=1
+    done
+}
+
+validate_name() {
+    [[ $CONTAINER_NAME =~ ^[A-Za-z0-9][A-Za-z0-9_.-]+$ ]] || die "Invalid container name '$CONTAINER_NAME'"
+}
+
+validate_port() {
+    [[ $PORT =~ ^[0-9]+$ ]] || die "Port must be numeric"
+    ((PORT >= 1 && PORT <= 65535)) || die "Port must be between 1 and 65535"
+}
+
+validate_sync_inputs() {
+    local -a normalized_core_versions=() normalized_core_os=() normalized_mep_versions=() normalized_mep_os=() normalized_installer_os=()
+    local repository_source_count=0 repository_authority
+    if ((${#CORE_VERSIONS[@]} > 0 || ${#CORE_OS[@]} > 0)); then
+        ((${#CORE_VERSIONS[@]} > 0 && ${#CORE_OS[@]} > 0)) ||
+            die "Core selection requires both --core-versions and --core-os"
+        normalize_version_list CORE_VERSIONS normalized_core_versions --core-versions
+        normalize_component_os_list Core CORE_OS normalized_core_os --core-os
+    fi
+    if ((${#MEP_VERSIONS[@]} > 0 || ${#MEP_OS[@]} > 0)); then
+        ((${#MEP_VERSIONS[@]} > 0 && ${#MEP_OS[@]} > 0)) ||
+            die "MEP selection requires both --mep-versions and --mep-os"
+        normalize_version_list MEP_VERSIONS normalized_mep_versions --mep-versions
+        normalize_component_os_list MEP MEP_OS normalized_mep_os --mep-os
+    fi
+    ((${#CORE_VERSIONS[@]} > 0 || ${#MEP_VERSIONS[@]} > 0 || ${#INSTALLER_OS[@]} > 0)) ||
+        die "Select at least one component: Core, MEP, or Installer"
+    if ((${#INSTALLER_OS[@]} > 0)); then
+        normalize_component_os_list Installer INSTALLER_OS normalized_installer_os --installer-os
+    else
+        normalized_installer_os=()
+    fi
+    [[ -z $REPO_URL ]] || repository_source_count=$((repository_source_count + 1))
+    [[ -z $REPO_URL_FILE ]] || repository_source_count=$((repository_source_count + 1))
+    [[ -z $REPO_CONFIG_FILE ]] || repository_source_count=$((repository_source_count + 1))
+    [[ $REPO_URL_STDIN != true ]] || repository_source_count=$((repository_source_count + 1))
+    ((repository_source_count == 1)) ||
+        die "Exactly one of --repo-url, --repo-url-file, --repo-config-file, or --repo-url-stdin is required"
+    if [[ $REPO_URL_STDIN == true ]]; then
+        prepare_repository_url_stdin
+    fi
+    if [[ -n $REPO_URL ]]; then
+        [[ $REPO_URL =~ ^https?://[^[:space:]]+$ ]] || die "--repo-url must be an HTTP(S) URL"
+        [[ $REPO_URL != *"?"* && $REPO_URL != *"#"* ]] || die "--repo-url must not contain a query string or fragment"
+        repository_authority=${REPO_URL#*://}
+        repository_authority=${repository_authority%%/*}
+        [[ $repository_authority != *@* ]] ||
+            die "--repo-url must not contain embedded credentials; use --repo-config-file"
+    else
+        local protected_repository_source protected_repository_option protected_repository_label
+        if [[ -n $REPO_CONFIG_FILE ]]; then
+            protected_repository_source=$REPO_CONFIG_FILE
+            protected_repository_option=--repo-config-file
+            protected_repository_label='Repository configuration file'
+        else
+            protected_repository_source=${REPOSITORY_STDIN_FILE:-$REPO_URL_FILE}
+            protected_repository_option=--repo-url-file
+            protected_repository_label='Repository URL file'
+        fi
+        [[ $protected_repository_source == /* ]] || die "$protected_repository_option must be an absolute path"
+        [[ -f $protected_repository_source && ! -L $protected_repository_source && \
+           -r $protected_repository_source && -s $protected_repository_source ]] || \
+            die "$protected_repository_label is missing, unreadable, empty, or a symbolic link"
+        local mode
+        mode=$(stat -c '%a' "$protected_repository_source")
+        [[ $mode =~ ^[0-7]+$ ]] && (((8#$mode & 077) == 0)) || die "$protected_repository_label permissions are unsafe"
+    fi
+    [[ -z $MAPR_SETUP_FILE || -z $MAPR_SETUP_URL ]] || die "Choose only one of --mapr-setup-file and --mapr-setup-url"
+    if [[ -n $MAPR_SETUP_FILE ]]; then
+        [[ $MAPR_SETUP_FILE == /* ]] || die "--mapr-setup-file must be an absolute path"
+        [[ $MAPR_SETUP_FILE != *$'\n'* && $MAPR_SETUP_FILE != *$'\r'* && $MAPR_SETUP_FILE != *$'\t'* ]] || \
+            die "--mapr-setup-file contains control characters"
+        [[ -f $MAPR_SETUP_FILE && ! -L $MAPR_SETUP_FILE && -r $MAPR_SETUP_FILE && -s $MAPR_SETUP_FILE ]] || \
+            die "mapr-setup.sh file is missing, unreadable, empty, or a symbolic link"
+    fi
+    if [[ -n $MAPR_SETUP_URL ]]; then
+        validate_downloader_url "$MAPR_SETUP_URL"
+    fi
+    if [[ -n $MAPR_SETUP_SHA256 ]]; then
+        [[ $MAPR_SETUP_SHA256 =~ ^[[:xdigit:]]{64}$ ]] || die "--mapr-setup-sha256 must contain exactly 64 hexadecimal characters"
+        MAPR_SETUP_SHA256=${MAPR_SETUP_SHA256,,}
+    fi
+    if [[ $UNSAFE_LOG_RAW_ARGV == true && $ACKNOWLEDGE_SECRET_EXPOSURE != true ]]; then
+        die "--unsafe-log-raw-argv requires --acknowledge-secret-exposure"
+    fi
+    if [[ $UNSAFE_LOG_RAW_ARGV != true && $ACKNOWLEDGE_SECRET_EXPOSURE == true ]]; then
+        die "--acknowledge-secret-exposure requires --unsafe-log-raw-argv"
+    fi
+    CORE_VERSIONS=("${normalized_core_versions[@]}")
+    CORE_OS=("${normalized_core_os[@]}")
+    MEP_VERSIONS=("${normalized_mep_versions[@]}")
+    MEP_OS=("${normalized_mep_os[@]}")
+    INSTALLER_OS=("${normalized_installer_os[@]}")
+}
+
+reject_downloader_options_for_serving_command() {
+    [[ -z $REPO_URL && -z $REPO_URL_FILE && -z $REPO_CONFIG_FILE && $REPO_URL_STDIN == false && \
+       -z $MAPR_SETUP_FILE && -z $MAPR_SETUP_URL && -z $MAPR_SETUP_SHA256 && \
+       $SKIP_DISK_SPACE_CHECK == false && $UNSAFE_LOG_RAW_ARGV == false && \
+       $ACKNOWLEDGE_SECRET_EXPOSURE == false ]] || \
+        die "Repository, downloader, disk-space, and unsafe argv options apply only to create/update synchronization"
+}
+
+validate_downloader_url() {
+    local value=$1
+    [[ $value =~ ^https?://[^[:space:]]+$ ]] || die "--mapr-setup-url must be an HTTP(S) URL"
+    [[ $value != *"@"* ]] || die "--mapr-setup-url must not contain embedded credentials"
+    [[ $value != *"?"* && $value != *"#"* ]] || die "--mapr-setup-url must not contain a query string or fragment"
+}
+
+detect_runtime() {
+    if [[ $RUNTIME == auto && -n ${AIRGAP_CONTAINER_ENGINE:-} ]]; then
+        RUNTIME=$AIRGAP_CONTAINER_ENGINE
+    fi
+    case $RUNTIME in
+        docker|podman)
+            if [[ $DRY_RUN != true ]]; then
+                command -v "$RUNTIME" >/dev/null 2>&1 || die "$RUNTIME is not installed"
+                "$RUNTIME" info >/dev/null 2>&1 || die "$RUNTIME is installed but not running or accessible"
+            fi
+            ;;
+        auto)
+            if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+                RUNTIME=docker
+            elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
+                RUNTIME=podman
+            elif [[ $DRY_RUN == true ]]; then
+                RUNTIME=docker
+            else
+                die "Neither Docker nor Podman is installed and accessible"
+            fi
+            ;;
+        *) die "Unsupported runtime '$RUNTIME'; use auto, docker, or podman" ;;
+    esac
+    local endpoint=
+    if [[ $RUNTIME == docker ]]; then
+        endpoint=${DOCKER_HOST:-}
+        if [[ -z $endpoint && $DRY_RUN != true ]]; then
+            endpoint=$(docker context inspect "$(docker context show)" --format '{{.Endpoints.docker.Host}}' 2>/dev/null || true)
+        fi
+    elif [[ $RUNTIME == podman ]]; then
+        endpoint=${CONTAINER_HOST:-}
+    fi
+    case $endpoint in
+        ''|unix://*|npipe://*) RUNTIME_REMOTE=false ;;
+        *) RUNTIME_REMOTE=true ;;
+    esac
+    info "Using container runtime: $RUNTIME"
+}
+
+container_exists() {
+    [[ $DRY_RUN == true ]] && return 1
+    "$RUNTIME" inspect "$CONTAINER_NAME" >/dev/null 2>&1
+}
+
+container_running() {
+    [[ $DRY_RUN == true ]] && return 0
+    [[ $("$RUNTIME" inspect --format '{{.State.Running}}' "$CONTAINER_NAME" 2>/dev/null) == true ]]
+}
+
+container_is_managed() {
+    [[ $DRY_RUN == true ]] && return 0
+    [[ $("$RUNTIME" inspect --format '{{index .Config.Labels "com.hpe.datafabric.airgap-repository"}}' "$CONTAINER_NAME" 2>/dev/null) == true ]]
+}
+
+port_is_available() {
+    if [[ ${AIRGAP_TEST_MODE:-0} == 1 && ${AIRGAP_TEST_PORT_IN_USE:-0} == 1 ]]; then
+        return 1
+    fi
+    [[ $DRY_RUN == true ]] && return 0
+    if [[ $RUNTIME_REMOTE == true ]]; then
+        ! "$RUNTIME" ps -q --filter "publish=$PORT" | grep -q .
+        return
+    fi
+    if command -v ss >/dev/null 2>&1; then
+        ! ss -ltnH "sport = :$PORT" 2>/dev/null | grep -q .
+    elif command -v lsof >/dev/null 2>&1; then
+        ! lsof -nP -iTCP:"$PORT" -sTCP:LISTEN 2>/dev/null | grep -q .
+    else
+        die "Cannot validate port availability: install ss or lsof"
+    fi
+}
+
+auto_discover_advertise_host() {
+    local candidate= interface=
+    if [[ $(uname -s) == Darwin ]]; then
+        if command -v route >/dev/null 2>&1 && command -v ipconfig >/dev/null 2>&1; then
+            interface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+            [[ -n $interface ]] && candidate=$(ipconfig getifaddr "$interface" 2>/dev/null || true)
+        fi
+    elif command -v ip >/dev/null 2>&1; then
+        candidate=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="src") {print $(i+1); exit}}')
+        if [[ -z $candidate ]]; then
+            candidate=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '$0 !~ /^127\./ && NF {print; exit}')
+        fi
+    fi
+    [[ -n $candidate ]] || return 1
+    printf '%s\n' "$candidate"
+}
+
+discover_advertise_host() {
+    if [[ -n $ADVERTISE_HOST ]]; then
+        [[ $ADVERTISE_HOST =~ ^\[?[A-Za-z0-9:.%_-]+\]?$ ]] || die "Invalid --advertise-host '$ADVERTISE_HOST'"
+        return 0
+    fi
+    [[ $RUNTIME_REMOTE != true ]] || die "Remote container runtime requires --advertise-host"
+    ADVERTISE_HOST=$(auto_discover_advertise_host) || die "Unable to determine a reachable host address; provide --advertise-host"
+}
+
+url_host() {
+    if [[ $ADVERTISE_HOST == *:* && $ADVERTISE_HOST != \[*\] ]]; then
+        printf '[%s]' "$ADVERTISE_HOST"
+    else
+        printf '%s' "$ADVERTISE_HOST"
+    fi
+}
+
+repository_url() {
+    printf 'http://%s:%s' "$(url_host)" "$PORT"
+}
+
+normalize_no_proxy() {
+    local combined=$1 item
+    local -a values=()
+    local -A seen=()
+    IFS=',' read -r -a raw_values <<< "$combined"
+    for item in "${raw_values[@]}"; do
+        item=${item//[[:space:]]/}
+        [[ -n $item && -z ${seen[$item]:-} ]] || continue
+        values+=("$item")
+        seen[$item]=1
+    done
+    local IFS=,
+    printf '%s' "${values[*]}"
+}
+
+prepare_proxy_environment() {
+    local no_proxy_host combined_no_proxy value mode line key
+    local file_http= file_HTTP= file_https= file_HTTPS= file_no= file_NO=
+    local -A seen=()
+    NETWORK_ARGS=()
+    if [[ -n $NETWORK_CONFIG_FILE ]]; then
+        [[ $HTTP_PROXY_SET == false && $HTTPS_PROXY_SET == false && $NO_PROXY_SET == false ]] || \
+            die "--network-config-file cannot be combined with explicit proxy options"
+        [[ $NETWORK_CONFIG_FILE == /* ]] || die "--network-config-file must be an absolute path"
+        [[ -f $NETWORK_CONFIG_FILE && ! -L $NETWORK_CONFIG_FILE && -r $NETWORK_CONFIG_FILE && -s $NETWORK_CONFIG_FILE ]] || \
+            die "Runtime network configuration is missing, unreadable, empty, or a symbolic link"
+        mode=$(stat -c '%a' "$NETWORK_CONFIG_FILE")
+        [[ $mode =~ ^[0-7]+$ ]] && (((8#$mode & 077) == 0)) || die "Runtime network configuration permissions are unsafe"
+        while IFS= read -r line || [[ -n $line ]]; do
+            [[ $line == *=* ]] || die "Runtime network configuration is malformed"
+            key=${line%%=*}; value=${line#*=}
+            case $key in
+                http_proxy) file_http=$value ;;
+                HTTP_PROXY) file_HTTP=$value ;;
+                https_proxy) file_https=$value ;;
+                HTTPS_PROXY) file_HTTPS=$value ;;
+                no_proxy) file_no=$value ;;
+                NO_PROXY) file_NO=$value ;;
+                *) die "Runtime network configuration contains an unsupported key" ;;
+            esac
+            [[ -z ${seen[$key]:-} ]] || die "Runtime network configuration contains a duplicate key"
+            [[ $value != *$'\r'* && $value != *$'\n'* ]] || die "Runtime network configuration contains control characters"
+            seen[$key]=1
+        done <"$NETWORK_CONFIG_FILE"
+        [[ -z $file_http || -z $file_HTTP || $file_http == "$file_HTTP" ]] || die "Runtime HTTP proxy variants disagree"
+        [[ -z $file_https || -z $file_HTTPS || $file_https == "$file_HTTPS" ]] || die "Runtime HTTPS proxy variants disagree"
+        [[ -z $file_no || -z $file_NO || $file_no == "$file_NO" ]] || die "Runtime no_proxy variants disagree"
+        HTTP_PROXY_VALUE=${file_http:-$file_HTTP}
+        HTTPS_PROXY_VALUE=${file_https:-$file_HTTPS}
+        NO_PROXY_VALUE=${file_no:-$file_NO}
+    fi
+    no_proxy_host=${ADVERTISE_HOST#[}
+    no_proxy_host=${no_proxy_host%]}
+    combined_no_proxy=$(normalize_no_proxy "$NO_PROXY_VALUE,$no_proxy_host,localhost,127.0.0.1,::1")
+    for value in "$HTTP_PROXY_VALUE" "$HTTPS_PROXY_VALUE" "$combined_no_proxy"; do
+        [[ $value != *$'\n'* && $value != *$'\r'* ]] || die "Proxy inputs must not contain control characters"
+    done
+    [[ -z $HTTP_PROXY_VALUE || $HTTP_PROXY_VALUE =~ ^https?://[^[:space:]]+$ ]] || die "--http-proxy must be an HTTP(S) URL"
+    [[ -z $HTTPS_PROXY_VALUE || $HTTPS_PROXY_VALUE =~ ^https?://[^[:space:]]+$ ]] || die "--https-proxy must be an HTTP(S) URL"
+    if [[ -z $NETWORK_CONFIG_FILE ]]; then
+        [[ $HTTP_PROXY_VALUE != *'@'* ]] || die "Credential-bearing HTTP proxies require --network-config-file"
+        [[ $HTTPS_PROXY_VALUE != *'@'* ]] || die "Credential-bearing HTTPS proxies require --network-config-file"
+    fi
+    [[ -n $HTTP_PROXY_VALUE || -n $HTTPS_PROXY_VALUE || -n $combined_no_proxy ]] || return 0
+    NETWORK_CONFIG_TEMP=$(mktemp "${TMPDIR:-/tmp}/airgap-network.XXXXXX")
+    chmod 0600 "$NETWORK_CONFIG_TEMP"
+    {
+        printf 'http_proxy=%s\nHTTP_PROXY=%s\n' "$HTTP_PROXY_VALUE" "$HTTP_PROXY_VALUE"
+        printf 'https_proxy=%s\nHTTPS_PROXY=%s\n' "$HTTPS_PROXY_VALUE" "$HTTPS_PROXY_VALUE"
+        printf 'no_proxy=%s\nNO_PROXY=%s\n' "$combined_no_proxy" "$combined_no_proxy"
+    } >"$NETWORK_CONFIG_TEMP"
+}
+
+prepare_repository_url_stdin() {
+    local raw_input input_status=0
+    [[ $REPO_URL_STDIN == true ]] || return 0
+    [[ -z $REPOSITORY_STDIN_FILE ]] || return 0
+    [[ ! -t 0 ]] ||
+        die "--repo-url-stdin requires piped or redirected standard input"
+
+    REPOSITORY_STDIN_TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/airgap-repository-stdin.XXXXXX") ||
+        die "Unable to create protected repository URL input directory"
+    trap cleanup_sync_host_temporaries EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    chmod 0700 "$REPOSITORY_STDIN_TEMP_DIR" ||
+        die "Unable to protect repository URL input directory"
+    raw_input="$REPOSITORY_STDIN_TEMP_DIR/repository-url.raw"
+    REPOSITORY_STDIN_FILE="$REPOSITORY_STDIN_TEMP_DIR/repository-url"
+    (umask 077; : >"$raw_input") ||
+        die "Unable to create protected raw repository URL input"
+    chmod 0600 "$raw_input" ||
+        die "Unable to protect raw repository URL input"
+    exec {REPOSITORY_STDIN_READER_FD}<&0 ||
+        die "Unable to duplicate standard input for protected repository URL reading"
+    cat <&"$REPOSITORY_STDIN_READER_FD" >"$raw_input" &
+    REPOSITORY_STDIN_READER_PID=$!
+    if wait "$REPOSITORY_STDIN_READER_PID"; then
+        REPOSITORY_STDIN_READER_PID=
+    else
+        REPOSITORY_STDIN_READER_PID=
+        die "Unable to read protected repository URL from standard input"
+    fi
+    exec {REPOSITORY_STDIN_READER_FD}<&-
+    REPOSITORY_STDIN_READER_FD=
+    [[ -s $raw_input ]] ||
+        die "--repo-url-stdin received no repository URL"
+
+    if LC_ALL=C awk '
+        NR == 1 {
+            line = $0
+            sub(/\r$/, "", line)
+            if (line ~ /^[[:space:]]*$/) {
+                exit 2
+            }
+            next
+        }
+        {
+            line = $0
+            sub(/\r$/, "", line)
+            if (line !~ /^[[:space:]]*$/) {
+                exit 3
+            }
+        }
+    ' "$raw_input"; then
+        input_status=0
+    else
+        input_status=$?
+    fi
+    case $input_status in
+        0) ;;
+        2) die "--repo-url-stdin received an empty repository URL" ;;
+        3) die "--repo-url-stdin accepts exactly one repository URL" ;;
+        *) die "Unable to validate protected repository URL from standard input" ;;
+    esac
+
+    (umask 077; head -n 1 "$raw_input" >"$REPOSITORY_STDIN_FILE") ||
+        die "Unable to create protected repository URL input"
+    chmod 0600 "$REPOSITORY_STDIN_FILE" ||
+        die "Unable to protect repository URL input"
+    rm -f -- "$raw_input" ||
+        die "Unable to remove temporary raw repository URL input"
+}
+
+cleanup_sync_host_temporaries() {
+    local rc=$? cleanup_repository_stdin=${1:-true}
+    if [[ -n ${REPOSITORY_STDIN_READER_PID:-} ]]; then
+        kill -TERM "$REPOSITORY_STDIN_READER_PID" 2>/dev/null || true
+        wait "$REPOSITORY_STDIN_READER_PID" 2>/dev/null || true
+        REPOSITORY_STDIN_READER_PID=
+    fi
+    if [[ -n ${REPOSITORY_STDIN_READER_FD:-} ]]; then
+        exec {REPOSITORY_STDIN_READER_FD}<&-
+        REPOSITORY_STDIN_READER_FD=
+    fi
+    [[ -z ${REPOSITORY_INPUT_TEMP:-} ]] || rm -f -- "$REPOSITORY_INPUT_TEMP"
+    [[ -z ${NETWORK_CONFIG_TEMP:-} ]] || rm -f -- "$NETWORK_CONFIG_TEMP"
+    [[ -z ${REPOSITORY_NORMALIZATION_TEMP:-} ]] || rm -rf -- "$REPOSITORY_NORMALIZATION_TEMP"
+    if [[ $cleanup_repository_stdin == true ]]; then
+        [[ -z ${REPOSITORY_STDIN_TEMP_DIR:-} ]] || rm -rf -- "$REPOSITORY_STDIN_TEMP_DIR"
+        REPOSITORY_STDIN_TEMP_DIR=
+        REPOSITORY_STDIN_FILE=
+    fi
+    REPOSITORY_INPUT_TEMP=
+    NETWORK_CONFIG_TEMP=
+    REPOSITORY_NORMALIZATION_TEMP=
+    return "$rc"
+}
+
+cleanup_serving_runtime_config() {
+    local rc=$?
+    [[ -z ${SERVING_RUNTIME_CONFIG_TEMP:-} ]] || rm -rf -- "$SERVING_RUNTIME_CONFIG_TEMP"
+    SERVING_RUNTIME_CONFIG_TEMP=
+    return "$rc"
+}
+
+cleanup_create_host_temporaries() {
+    local rc=$? cleanup_repository_stdin=${1:-true}
+    cleanup_serving_runtime_config
+    cleanup_sync_host_temporaries "$cleanup_repository_stdin"
+    return "$rc"
+}
+
+prepare_serving_runtime_command() {
+    local name current_context original_config subdirectory
+    SERVING_RUNTIME_COMMAND=(env)
+    for name in "${SERVING_PROXY_ENV_NAMES[@]}"; do
+        SERVING_RUNTIME_COMMAND+=(-u "$name")
+    done
+    SERVING_RUNTIME_RUN_ARGS=()
+    SERVING_ENV_ARGS=(-e AIRGAP_DATA_ROOT=/data)
+
+    case $RUNTIME in
+        docker)
+            if [[ $DRY_RUN == true ]]; then
+                SERVING_RUNTIME_COMMAND+=(docker --config '<isolated-serving-config>')
+                return
+            fi
+            SERVING_RUNTIME_CONFIG_TEMP=$(mktemp -d "${TMPDIR:-/tmp}/airgap-serving-runtime.XXXXXX")
+            chmod 0700 "$SERVING_RUNTIME_CONFIG_TEMP"
+            printf '{}\n' >"$SERVING_RUNTIME_CONFIG_TEMP/config.json"
+            chmod 0600 "$SERVING_RUNTIME_CONFIG_TEMP/config.json"
+
+            # Docker's client-side "proxies" configuration injects proxy
+            # variables into every new container. Use a clean client config
+            # for the serving role while retaining an explicitly selected
+            # non-default context when one is required.
+            if [[ -z ${DOCKER_HOST:-} ]]; then
+                current_context=$(docker context show 2>/dev/null) || \
+                    die "Unable to determine the Docker context for serving-container creation"
+                if [[ -n $current_context && $current_context != default ]]; then
+                    original_config=${DOCKER_CONFIG:-${HOME:?}/.docker}
+                    for subdirectory in contexts certs; do
+                        [[ ! -e "$original_config/$subdirectory" ]] || \
+                            ln -s -- "$original_config/$subdirectory" "$SERVING_RUNTIME_CONFIG_TEMP/$subdirectory"
+                    done
+                    SERVING_RUNTIME_COMMAND+=(docker --config "$SERVING_RUNTIME_CONFIG_TEMP" --context "$current_context")
+                    return
+                fi
+            fi
+            SERVING_RUNTIME_COMMAND+=(docker --config "$SERVING_RUNTIME_CONFIG_TEMP")
+            ;;
+        podman)
+            SERVING_RUNTIME_COMMAND+=(podman)
+            SERVING_RUNTIME_RUN_ARGS+=(--http-proxy=false)
+            ;;
+        *)
+            die "Internal error: unsupported serving runtime '$RUNTIME'"
+            ;;
+    esac
+}
+
+serving_container_forbidden_environment() {
+    local entry name
+    "$RUNTIME" inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER_NAME" |
+        while IFS= read -r entry; do
+            name=${entry%%=*}
+            case $name in
+                http_proxy|HTTP_PROXY|https_proxy|HTTPS_PROXY|no_proxy|NO_PROXY|\
+                AIRGAP_NETWORK_CONFIG|AIRGAP_CA_CERT|AIRGAP_REPOSITORY_*|AIRGAP_MAPR_SETUP_*)
+                    printf '%s\n' "$name"
+                    ;;
+            esac
+        done | LC_ALL=C sort -u
+}
+
+validate_serving_container_environment() {
+    local leaked removal_status
+    [[ $DRY_RUN != true ]] || return 0
+    leaked=$(serving_container_forbidden_environment) || \
+        die "Unable to inspect serving-container environment isolation"
+    [[ -z $leaked ]] && return 0
+    leaked=${leaked//$'\n'/,}
+    if "$RUNTIME" rm -f "$CONTAINER_NAME" >/dev/null 2>&1; then
+        removal_status="the newly created container was removed"
+    else
+        removal_status="removal of the newly created container also failed"
+    fi
+    die "Serving container isolation failed; forbidden helper-only environment variables: $leaked; $removal_status"
+}
+
+prepare_mounts() {
+    local data_suffix= secret_suffix=
+    if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then
+        # /data and a custom CA can be shared by the serving and update
+        # containers. The credentials file is private to one helper.
+        data_suffix=:z
+        secret_suffix=,Z
+    fi
+    DATA_MOUNT="$DATA_DIR:/data$data_suffix"
+    REPOSITORY_INPUT_ARGS=()
+    NETWORK_ARGS=()
+    MAPR_SETUP_MOUNT_ARGS=()
+    if [[ -n $MAPR_SETUP_FILE ]]; then
+        MAPR_SETUP_MOUNT_ARGS=(-v "$MAPR_SETUP_FILE:/run/config/mapr-setup-source.sh:ro$secret_suffix")
+    fi
+    CA_ARGS=()
+    if [[ -n $CA_CERT ]]; then
+        [[ -f $CA_CERT && ! -L $CA_CERT && -r $CA_CERT && -s $CA_CERT ]] || die "Custom CA certificate is missing, unreadable, empty, or a symbolic link"
+        CA_ARGS=(-v "$CA_CERT:/run/secrets/custom-ca.crt:ro$secret_suffix" -e AIRGAP_CA_CERT=/run/secrets/custom-ca.crt)
+    fi
+}
+
+build_image_command() {
+    printf '=== Build image ===\n'
+    [[ -d $COMPONENT_DIR ]] || die "Component directory not found: $COMPONENT_DIR"
+    if [[ $DRY_RUN == true ]]; then
+        echo "+ prepare temporary Docker build context from $COMPONENT_DIR"
+        echo "+ build generic runtime without mapr-setup.sh"
+        render_command "$RUNTIME" build -t "$IMAGE" '<temporary-build-context>'
+        return
+    fi
+    local context rc=0 source_file
+    local -a context_files=(Dockerfile airgap-repository-runtime repository-url.py downloader-retrieval.sh entrypoint.sh healthcheck.sh nginx.conf)
+    context=$(mktemp -d)
+    cleanup_build_context() {
+        rm -rf -- "$context"
+    }
+    trap cleanup_build_context EXIT HUP INT TERM
+    for source_file in "${context_files[@]}"; do
+        [[ -f "$COMPONENT_DIR/$source_file" ]] || die "Required build file is missing: $COMPONENT_DIR/$source_file"
+        cp -a "$COMPONENT_DIR/$source_file" "$context/$source_file"
+    done
+    info "Building generic runtime image $IMAGE (no mapr-setup.sh in build context)"
+    if "$RUNTIME" build -t "$IMAGE" "$context"; then
+        rc=0
+    else
+        rc=$?
+        printf "ERROR: phase 'Build image' failed: %s build exited with status %d\n" \
+            "$RUNTIME" "$rc" >&2
+    fi
+    cleanup_build_context
+    trap - EXIT HUP INT TERM
+    return "$rc"
+}
+
+push_image_command() {
+    local rc=0
+    printf '=== Push image ===\n'
+    info "Pushing image $IMAGE"
+    if run_command "$RUNTIME" push "$IMAGE"; then
+        return 0
+    else
+        rc=$?
+    fi
+    printf "ERROR: phase 'Push image' failed: %s push exited with status %d\n" \
+        "$RUNTIME" "$rc" >&2
+    return "$rc"
+}
+
+ensure_image() {
+    if [[ $BUILD_IMAGE == true ]]; then
+        build_image_command
+    elif [[ $LOCAL_IMAGE == true ]]; then
+        if [[ $DRY_RUN != true ]]; then
+            "$RUNTIME" image inspect "$IMAGE" >/dev/null 2>&1 || die "Local image not found: $IMAGE"
+        fi
+        info "Using local image: $IMAGE"
+    else
+        info "Pulling image: $IMAGE"
+        run_command "$RUNTIME" pull "$IMAGE"
+    fi
+}
+
+run_packaged_url_helper() {
+    local input_name=$1 metadata_name=$2 input_mode=$3 invalid_message=$4
+    local input_path="$REPOSITORY_NORMALIZATION_TEMP/$input_name"
+    local metadata_path="$REPOSITORY_NORMALIZATION_TEMP/$metadata_name"
+    local diagnostics_path="$REPOSITORY_NORMALIZATION_TEMP/helper.stderr"
+    local helper_path=/usr/local/libexec/airgap-repository/repository-url.py
+    local secret_suffix= rc=0
+    local -a helper_args=()
+    case $input_mode in
+        structured-config)
+            helper_args=(--config-file "/run/airgap-url-helper/$input_name" --auth-output-dir /run/airgap-url-helper/auth)
+            ;;
+        protected-url)
+            helper_args=(--input-file "/run/airgap-url-helper/$input_name" --allow-userinfo --auth-output-dir /run/airgap-url-helper/auth)
+            ;;
+        public-url) helper_args=(--input-file "/run/airgap-url-helper/$input_name") ;;
+        *) die "Unsupported protected repository input mode" ;;
+    esac
+    if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then secret_suffix=,Z; fi
+    local -a helper_cmd=(
+        "$RUNTIME" run --rm
+        --name "$CONTAINER_NAME-url-helper-$$"
+        --network none
+        --user "$(id -u):$(id -g)"
+        -v "$REPOSITORY_NORMALIZATION_TEMP:/run/airgap-url-helper:rw$secret_suffix"
+        --entrypoint "$helper_path"
+        "$IMAGE"
+        "${helper_args[@]}"
+    )
+
+    if [[ $DRY_RUN == true ]]; then
+        render_command "${helper_cmd[@]}"
+        return 0
+    fi
+    [[ -f $input_path && ! -L $input_path && -r $input_path && -s $input_path ]] || \
+        die "Protected repository URL helper input cannot be read"
+    if "${helper_cmd[@]}" >"$metadata_path" 2>"$diagnostics_path"; then
+        rc=0
+    else
+        rc=$?
+    fi
+    case $rc in
+        0) ;;
+        2) die "$invalid_message" ;;
+        3) die "Repository URL contains invalid or unescaped authentication data; use percent-encoded userinfo or --repo-config-file" ;;
+        4) die "Repository configuration contains an unsupported key" ;;
+        5) die "Repository configuration contains a duplicate key" ;;
+        6) die "Repository configuration has a missing or empty required field" ;;
+        7) die "Repository configuration contains unsafe control characters or invalid text encoding" ;;
+        8) die "Repository configuration syntax is malformed" ;;
+        9) die "Repository configuration field 'repository_url' is not a credential-free HTTP(S) URL" ;;
+        10) die "Repository configuration username/password contains unsupported whitespace" ;;
+        11) die "Repository configuration file type or permissions are unsafe" ;;
+        125|126|127) die "Repository URL helper container could not be started" ;;
+        *) die "Repository URL helper failed internally" ;;
+    esac
+    [[ -f $metadata_path && ! -L $metadata_path && -r $metadata_path && -s $metadata_path ]] || \
+        die "Repository URL helper produced no readable metadata"
+    if grep -Eq '"authentication"[[:space:]]*:[[:space:]]*"(embedded-userinfo|structured-config)"' "$metadata_path"; then
+        [[ -f "$REPOSITORY_NORMALIZATION_TEMP/auth/curl.conf" && \
+           -f "$REPOSITORY_NORMALIZATION_TEMP/auth/credentials.conf" ]] || \
+            die "Repository URL helper did not create protected authentication files"
+        [[ $(stat -c '%a' "$REPOSITORY_NORMALIZATION_TEMP/auth/curl.conf") == 600 && \
+           $(stat -c '%a' "$REPOSITORY_NORMALIZATION_TEMP/auth/credentials.conf") == 600 ]] || \
+            die "Repository URL helper authentication file permissions are unsafe"
+    fi
+}
+
+preflight_repository_urls() {
+    local repository_source repository_input_mode=public-url invalid_repository_message
+    if [[ $DRY_RUN != true ]] && ! "$RUNTIME" image inspect "$IMAGE" >/dev/null 2>&1; then
+        die "Selected image is unavailable: $IMAGE"
+    fi
+    REPOSITORY_NORMALIZATION_TEMP=$(mktemp -d "${TMPDIR:-/tmp}/airgap-url-helper.XXXXXX") || \
+        die "Unable to create protected repository URL helper directory"
+    chmod 0700 "$REPOSITORY_NORMALIZATION_TEMP" || \
+        die "Unable to protect repository URL helper directory"
+    trap cleanup_sync_host_temporaries EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if [[ $REPO_URL_STDIN == true ]]; then
+        repository_source=$REPOSITORY_STDIN_FILE
+        repository_input_mode=protected-url
+    elif [[ -n $REPO_URL_FILE ]]; then
+        repository_source=$REPO_URL_FILE
+        repository_input_mode=protected-url
+    elif [[ -n $REPO_CONFIG_FILE ]]; then
+        repository_source=$REPO_CONFIG_FILE
+        repository_input_mode=structured-config
+    else
+        repository_source=
+    fi
+    if [[ -n $repository_source ]]; then
+        cp -- "$repository_source" "$REPOSITORY_NORMALIZATION_TEMP/repository.input" || \
+            die "Unable to create protected repository URL helper input"
+    else
+        printf '%s' "$REPO_URL" >"$REPOSITORY_NORMALIZATION_TEMP/repository.input" || \
+            die "Unable to create protected repository URL helper input"
+    fi
+    chmod 0600 "$REPOSITORY_NORMALIZATION_TEMP/repository.input" || \
+        die "Unable to protect repository URL helper input"
+    if [[ $repository_input_mode == structured-config ]]; then
+        invalid_repository_message="Repository configuration is invalid; check repository_url, username, password, and file syntax"
+    elif [[ $repository_input_mode == protected-url ]]; then
+        invalid_repository_message="Repository URL is not a supported HTTP(S) URL for the selected input mode"
+    else
+        invalid_repository_message="Repository URL is not a supported credential-free HTTP(S) URL"
+    fi
+    run_packaged_url_helper repository.input repository.json "$repository_input_mode" "$invalid_repository_message"
+
+    if [[ -n $MAPR_SETUP_URL ]]; then
+        printf '%s' "$MAPR_SETUP_URL" >"$REPOSITORY_NORMALIZATION_TEMP/downloader.input" || \
+            die "Unable to create protected downloader URL helper input"
+        chmod 0600 "$REPOSITORY_NORMALIZATION_TEMP/downloader.input" || \
+            die "Unable to protect downloader URL helper input"
+        run_packaged_url_helper downloader.input downloader.json public-url \
+            "--mapr-setup-url must be a credential-free HTTP(S) URL without query or fragment"
+    fi
+
+    cleanup_sync_host_temporaries false
+    if [[ $REPO_URL_STDIN == true ]]; then
+        trap cleanup_sync_host_temporaries EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+    else
+        trap - EXIT HUP INT TERM
+    fi
+}
+
+create_data_directory() {
+    local normalized resolved marker existing=false target
+    [[ -n $DATA_DIR && $DATA_DIR == /* ]] || die "--data-dir must be a non-empty absolute path"
+    normalized=${DATA_DIR%/}
+    [[ -n $normalized ]] || normalized=/
+    case $normalized in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/lib32|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib)
+            die "Refusing unsafe data directory '$DATA_DIR'"
+            ;;
+    esac
+    resolved=$(realpath -m -- "$DATA_DIR")
+    [[ $resolved == "$normalized" ]] || die "--data-dir must be canonical and must not traverse symlinks: $DATA_DIR"
+    if [[ -e $DATA_DIR || -L $DATA_DIR ]]; then
+        existing=true
+        [[ -d $DATA_DIR && ! -L $DATA_DIR ]] || die "Data directory must be a regular directory, not a symbolic link: $DATA_DIR"
+        resolved=$(realpath -e -- "$DATA_DIR")
+        [[ $resolved == "$normalized" ]] || die "--data-dir must be canonical and must not traverse symlinks: $DATA_DIR"
+        command -v findmnt >/dev/null 2>&1 || die "findmnt is required to validate existing data-directory mount ownership"
+        while IFS= read -r target; do
+            [[ -z $target || $target == "$resolved" || $target != "$resolved/"* ]] || \
+                die "Refusing data directory containing a nested mount: $target"
+        done < <(findmnt -Rrn -o TARGET --target "$resolved")
+    fi
+    marker="$DATA_DIR/$DATA_MARKER_NAME"
+    if [[ -e $marker || -L $marker ]]; then
+        [[ -f $marker && ! -L $marker ]] || die "Repository marker is not a regular file: $marker"
+        grep -Fqx "$DATA_MARKER_SIGNATURE" "$marker" || die "Repository marker has unexpected content: $marker"
+    elif [[ $existing == true && -n $(find "$DATA_DIR" -mindepth 1 -maxdepth 1 -print -quit) ]]; then
+        die "Refusing to adopt existing nonempty unmarked data directory: $DATA_DIR"
+    fi
+    if [[ $DRY_RUN == true ]]; then
+        [[ $existing == true ]] || echo "+ mkdir -p $DATA_DIR"
+        [[ -e $marker ]] || echo "+ create repository marker $marker"
+        return
+    fi
+    mkdir -p "$DATA_DIR" || die "Unable to create data directory $DATA_DIR"
+    [[ -d $DATA_DIR && -w $DATA_DIR ]] || die "Data directory is not writable: $DATA_DIR"
+    [[ ! -L $DATA_DIR ]] || die "Data directory must not be a symbolic link: $DATA_DIR"
+    chmod 0755 "$DATA_DIR"
+    if [[ -f $marker ]]; then
+        grep -Fqx "$DATA_MARKER_SIGNATURE" "$marker" || die "Repository marker has unexpected content: $marker"
+    else
+        printf '%s\n' "$DATA_MARKER_SIGNATURE" >"$marker"
+        chmod 0644 "$marker"
+    fi
+}
+
+require_data_marker() {
+    local marker="$DATA_DIR/$DATA_MARKER_NAME"
+    [[ -f $marker && ! -L $marker ]] || die "Repository marker is missing: $marker"
+    grep -Fqx "$DATA_MARKER_SIGNATURE" "$marker" || die "Repository marker has unexpected content: $marker"
+}
+
+discover_existing_data_dir() {
+    local existing
+    [[ $DRY_RUN != true ]] || return 0
+    existing=$("$RUNTIME" inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME")
+    [[ -n $existing ]] || die "Container '$CONTAINER_NAME' has no /data mount"
+    if [[ $DATA_DIR_SET == true && $DATA_DIR != "$existing" ]]; then
+        die "--data-dir '$DATA_DIR' does not match the container /data source '$existing'"
+    fi
+    DATA_DIR=$existing
+}
+
+discover_existing_image() {
+    local existing
+    [[ $DRY_RUN != true ]] || return 0
+    existing=$("$RUNTIME" inspect --format '{{.Config.Image}}' "$CONTAINER_NAME")
+    [[ -n $existing ]] || die "Unable to determine image for container '$CONTAINER_NAME'"
+    [[ $IMAGE_SET == true ]] || IMAGE=$existing
+}
+
+run_sync_helper() {
+    local -a component_args=() downloader_args=() sync_args helper_cmd source_type_args=() unsafe_args=() repository_sync_args=() disk_space_args=()
+    local repository_input_source repository_mount_target
+    if ((${#CORE_VERSIONS[@]} > 0)); then
+        component_args+=(--core-versions "${CORE_VERSIONS[@]}" --core-os "${CORE_OS[@]}")
+    fi
+    if ((${#MEP_VERSIONS[@]} > 0)); then
+        component_args+=(--mep-versions "${MEP_VERSIONS[@]}" --mep-os "${MEP_OS[@]}")
+    fi
+    ((${#INSTALLER_OS[@]} == 0)) || component_args+=(--installer-os "${INSTALLER_OS[@]}")
+    prepare_proxy_environment
+    trap cleanup_sync_host_temporaries EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    if [[ $REPO_URL_STDIN == true ]]; then
+        repository_input_source=$REPOSITORY_STDIN_FILE
+    elif [[ -n $REPO_URL_FILE ]]; then
+        repository_input_source=$REPO_URL_FILE
+    elif [[ -n $REPO_CONFIG_FILE ]]; then
+        repository_input_source=$REPO_CONFIG_FILE
+    else
+        REPOSITORY_INPUT_TEMP=$(mktemp "${TMPDIR:-/tmp}/airgap-repository-url.XXXXXX")
+        chmod 0600 "$REPOSITORY_INPUT_TEMP"
+        printf '%s' "$REPO_URL" >"$REPOSITORY_INPUT_TEMP"
+        repository_input_source=$REPOSITORY_INPUT_TEMP
+    fi
+    local secret_suffix=
+    if command -v selinuxenabled >/dev/null 2>&1 && selinuxenabled; then secret_suffix=,Z; fi
+    if [[ -n $REPO_CONFIG_FILE ]]; then
+        repository_mount_target=/run/secrets/repository.conf
+        repository_sync_args=(--repo-config-file "$repository_mount_target")
+    else
+        repository_mount_target=/run/secrets/repository-url
+        repository_sync_args=(--repo-url-file "$repository_mount_target")
+    fi
+    REPOSITORY_INPUT_ARGS=(-v "$repository_input_source:$repository_mount_target:ro$secret_suffix")
+    if [[ -n $NETWORK_CONFIG_FILE || -n $NETWORK_CONFIG_TEMP ]]; then
+        local network_config_source=${NETWORK_CONFIG_TEMP:-$NETWORK_CONFIG_FILE}
+        NETWORK_ARGS=(-v "$network_config_source:/run/secrets/network.env:ro$secret_suffix" -e AIRGAP_NETWORK_CONFIG=/run/secrets/network.env)
+    fi
+    if [[ -n $MAPR_SETUP_FILE ]]; then
+        downloader_args=(--mapr-setup-file /run/config/mapr-setup-source.sh)
+    elif [[ -n $MAPR_SETUP_URL ]]; then
+        downloader_args=(--mapr-setup-url "$MAPR_SETUP_URL")
+    fi
+    [[ -z $MAPR_SETUP_SHA256 ]] || downloader_args+=(--mapr-setup-sha256 "$MAPR_SETUP_SHA256")
+    if [[ $UNSAFE_LOG_RAW_ARGV == true ]]; then
+        unsafe_args=(--unsafe-log-raw-argv --acknowledge-secret-exposure)
+        echo "WARNING: unsafe raw argv logging is enabled." >&2
+        echo "WARNING: Repository credentials, proxy credentials, tokens, and filesystem paths may appear in logs and retrieved artifacts." >&2
+    fi
+    [[ $SKIP_DISK_SPACE_CHECK != true ]] || disk_space_args=(--skip-disk-space-check)
+    if [[ ${AIRGAP_TEST_DOWNLOADER_SOURCE_TYPE:-} == fake ]]; then
+        source_type_args=(-e AIRGAP_MAPR_SETUP_SOURCE_TYPE=fake)
+    fi
+    sync_args=(
+        "${component_args[@]}"
+        "${repository_sync_args[@]}"
+        "${downloader_args[@]}"
+        "${disk_space_args[@]}"
+        "${unsafe_args[@]}"
+    )
+    helper_cmd=(
+        "$RUNTIME" run --rm
+        --name "$CONTAINER_NAME-update-$$"
+        --label com.hpe.datafabric.airgap-repository=true
+        --network "container:$CONTAINER_NAME"
+        -v "$DATA_MOUNT"
+        "${REPOSITORY_INPUT_ARGS[@]}"
+        "${MAPR_SETUP_MOUNT_ARGS[@]}"
+        "${NETWORK_ARGS[@]}"
+        "${CA_ARGS[@]}"
+        "${source_type_args[@]}"
+    )
+    append_e2e_container_labels helper_cmd
+    helper_cmd+=("$IMAGE" airgap-repository-runtime sync "${sync_args[@]}")
+    info "Running repository synchronization helper"
+    local rc=0
+    if run_command "${helper_cmd[@]}"; then rc=0; else rc=$?; fi
+    cleanup_sync_host_temporaries
+    trap - EXIT HUP INT TERM
+    return "$rc"
+}
+
+wait_for_readiness() {
+    if [[ $DRY_RUN == true ]]; then
+        echo "+ wait for $CONTAINER_NAME repository health"
+        return
+    fi
+    local attempt
+    for attempt in $(seq 1 60); do
+        if "$RUNTIME" exec "$CONTAINER_NAME" /usr/local/bin/healthcheck.sh >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 2
+    done
+    "$RUNTIME" logs --tail 50 "$CONTAINER_NAME" >&2 || true
+    die "Repository container did not become healthy within 120 seconds"
+}
+
+discover_existing_port() {
+    [[ $PORT_SET == true || $DRY_RUN == true ]] && return
+    local mapping
+    mapping=$("$RUNTIME" port "$CONTAINER_NAME" 80/tcp 2>/dev/null | head -n1 || true)
+    if [[ $mapping =~ :([0-9]+)$ ]]; then
+        PORT=${BASH_REMATCH[1]}
+    fi
+}
+
+create_container() {
+    validate_sync_inputs
+    validate_name
+    validate_port
+    detect_runtime
+    container_exists && die "Container '$CONTAINER_NAME' already exists; use update, start, or remove"
+    port_is_available || die "Host port $PORT is already in use"
+    discover_advertise_host
+    prepare_mounts
+    create_data_directory
+    ensure_image
+    preflight_repository_urls
+
+    local -a run_args
+    local create_rc=0
+    trap cleanup_create_host_temporaries EXIT
+    trap 'cleanup_create_host_temporaries; exit 129' HUP
+    trap 'cleanup_create_host_temporaries; exit 130' INT
+    trap 'cleanup_create_host_temporaries; exit 143' TERM
+    prepare_serving_runtime_command
+    run_args=(
+        "${SERVING_RUNTIME_COMMAND[@]}" run
+        "${SERVING_RUNTIME_RUN_ARGS[@]}"
+        -d
+        --name "$CONTAINER_NAME"
+        --label com.hpe.datafabric.airgap-repository=true
+        --restart unless-stopped
+        -p "$PORT:80"
+        -v "$DATA_MOUNT"
+        "${SERVING_ENV_ARGS[@]}"
+    )
+    append_e2e_container_labels run_args
+    run_args+=("$IMAGE")
+    info "Creating repository serving container"
+    if run_command "${run_args[@]}"; then
+        create_rc=0
+    else
+        create_rc=$?
+    fi
+    cleanup_create_host_temporaries false
+    if [[ $REPO_URL_STDIN == true ]]; then
+        trap cleanup_sync_host_temporaries EXIT
+        trap 'exit 129' HUP
+        trap 'exit 130' INT
+        trap 'exit 143' TERM
+    else
+        trap - EXIT HUP INT TERM
+    fi
+    ((create_rc == 0)) || return "$create_rc"
+
+    if [[ $DRY_RUN != true ]]; then
+        container_running || die "Container '$CONTAINER_NAME' failed to start"
+        validate_serving_container_environment
+    fi
+    local sync_rc=0
+    if run_sync_helper; then
+        :
+    else
+        sync_rc=$?
+        echo "ERROR: Initial mapr-setup.sh repository synchronization failed; data was preserved for retry" >&2
+        return "$sync_rc"
+    fi
+    wait_for_readiness
+    echo "Air-gap repository URL: $(repository_url)"
+}
+
+update_container() {
+    validate_sync_inputs
+    validate_name
+    detect_runtime
+    container_exists || { [[ $DRY_RUN == true ]] || die "Container '$CONTAINER_NAME' does not exist"; }
+    container_is_managed || die "Container '$CONTAINER_NAME' is not managed by this script"
+    container_running || die "Container '$CONTAINER_NAME' is not running; start it before update"
+    discover_existing_data_dir
+    discover_existing_image
+    preflight_repository_urls
+    [[ -d $DATA_DIR || $DRY_RUN == true ]] || die "Persistent data directory does not exist: $DATA_DIR"
+    [[ $DRY_RUN == true ]] || require_data_marker
+    discover_advertise_host
+    prepare_mounts
+    local sync_rc=0
+    if run_sync_helper; then
+        :
+    else
+        sync_rc=$?
+        echo "ERROR: mapr-setup.sh update failed; the existing publication remains available" >&2
+        return "$sync_rc"
+    fi
+    wait_for_readiness
+    discover_existing_port
+    echo "Air-gap repository URL: $(repository_url)"
+}
+
+start_container() {
+    detect_runtime
+    container_exists || { [[ $DRY_RUN == true ]] || die "Container '$CONTAINER_NAME' does not exist"; }
+    container_is_managed || die "Container '$CONTAINER_NAME' is not managed by this script"
+    run_command "$RUNTIME" start "$CONTAINER_NAME"
+    wait_for_readiness
+    discover_advertise_host
+    discover_existing_port
+    echo "Air-gap repository URL: $(repository_url)"
+}
+
+stop_container() {
+    detect_runtime
+    container_exists || { [[ $DRY_RUN == true ]] || die "Container '$CONTAINER_NAME' does not exist"; }
+    container_is_managed || die "Container '$CONTAINER_NAME' is not managed by this script"
+    run_command "$RUNTIME" stop "$CONTAINER_NAME"
+}
+
+restart_container() {
+    detect_runtime
+    container_exists || { [[ $DRY_RUN == true ]] || die "Container '$CONTAINER_NAME' does not exist"; }
+    container_is_managed || die "Container '$CONTAINER_NAME' is not managed by this script"
+    run_command "$RUNTIME" restart "$CONTAINER_NAME"
+    wait_for_readiness
+    discover_advertise_host
+    discover_existing_port
+    echo "Air-gap repository URL: $(repository_url)"
+}
+
+status_container() {
+    detect_runtime
+    if ! container_exists; then
+        [[ $DRY_RUN == true ]] && render_command "$RUNTIME" inspect "$CONTAINER_NAME"
+        echo "Container '$CONTAINER_NAME' does not exist"
+        return 1
+    fi
+    container_is_managed || die "Container '$CONTAINER_NAME' is not managed by this script"
+    local state health image actual_data active_publication usage available advertised_url auto_host
+    state=$("$RUNTIME" inspect --format '{{.State.Status}}' "$CONTAINER_NAME")
+    health=$("$RUNTIME" inspect --format '{{.State.Health.Status}}' "$CONTAINER_NAME" 2>/dev/null || true)
+    image=$("$RUNTIME" inspect --format '{{.Config.Image}}' "$CONTAINER_NAME")
+    actual_data=$("$RUNTIME" inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Source}}{{end}}{{end}}' "$CONTAINER_NAME")
+    discover_existing_port
+    if [[ -n $ADVERTISE_HOST ]]; then
+        discover_advertise_host
+        advertised_url=$(repository_url)
+    elif [[ $RUNTIME_REMOTE != true ]] && auto_host=$(auto_discover_advertise_host); then
+        ADVERTISE_HOST=$auto_host
+        advertised_url=$(repository_url)
+    else
+        advertised_url="unavailable (provide --advertise-host)"
+    fi
+    active_publication=none
+    usage=unavailable
+    available=unavailable
+    if [[ $RUNTIME_REMOTE != true && -n $actual_data && -d $actual_data ]]; then
+        [[ -L "$actual_data/repository" ]] && active_publication=$(readlink "$actual_data/repository")
+        usage=$(du -sh "$actual_data" 2>/dev/null | awk '{print $1}')
+        available=$(df -h --output=avail "$actual_data" 2>/dev/null | awk 'NR==2 {print $1}')
+    fi
+    echo "Container name: $CONTAINER_NAME"
+    echo "Runtime: $RUNTIME"
+    echo "Container state: $state"
+    echo "Health state: ${health:-unavailable}"
+    echo "Image: $image"
+    echo "Host port: $PORT"
+    echo "Advertised URL: $advertised_url"
+    echo "Data directory: ${actual_data:-unavailable}"
+    echo "Active publication: $active_publication"
+    echo "Repository disk usage: ${usage:-unavailable}"
+    echo "Available disk space: ${available:-unavailable}"
+    if container_running; then
+        "$RUNTIME" exec "$CONTAINER_NAME" airgap-repository-runtime status || true
+    fi
+}
+
+print_container_url() {
+    validate_port
+    detect_runtime
+    container_exists || { [[ $DRY_RUN == true ]] || die "Container '$CONTAINER_NAME' does not exist"; }
+    container_is_managed || die "Container '$CONTAINER_NAME' is not managed by this script"
+    container_running || die "Container '$CONTAINER_NAME' is not running"
+    wait_for_readiness
+    discover_existing_port
+    discover_advertise_host
+    echo "Air-gap repository URL: $(repository_url)"
+}
+
+remove_container() {
+    detect_runtime
+    if container_exists; then
+        container_is_managed || die "Container '$CONTAINER_NAME' is not managed by this script"
+        discover_existing_data_dir
+        run_command "$RUNTIME" rm -f "$CONTAINER_NAME"
+        info "Container removed; persistent data was preserved at $DATA_DIR"
+    else
+        info "Container '$CONTAINER_NAME' does not exist; persistent data was not changed"
+    fi
+}
+
+purge_data() {
+    local normalized resolved marker
+    [[ $ASSUME_YES == true ]] || die "purge-data requires --yes"
+    [[ -n $DATA_DIR && $DATA_DIR == /* ]] || die "Refusing empty or non-absolute data directory '$DATA_DIR'"
+    normalized=${DATA_DIR%/}
+    [[ -n $normalized ]] || normalized=/
+    case $normalized in
+        /|/bin|/boot|/dev|/etc|/home|/lib|/lib32|/lib64|/media|/mnt|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/var|/var/lib)
+            die "Refusing unsafe data directory '$DATA_DIR'"
+            ;;
+    esac
+    detect_runtime
+    if container_exists; then
+        container_is_managed || die "Container '$CONTAINER_NAME' is not managed by this script"
+        die "Remove container '$CONTAINER_NAME' before purging data"
+    fi
+    [[ -e $DATA_DIR ]] || { info "Data path does not exist: $DATA_DIR"; return; }
+    resolved=$(realpath -e -- "$DATA_DIR")
+    [[ $resolved == "$normalized" && ! -L $DATA_DIR ]] || die "Refusing non-canonical or symbolic data directory '$DATA_DIR'"
+    marker="$resolved/$DATA_MARKER_NAME"
+    [[ -f $marker && ! -L $marker ]] || die "Refusing purge because repository marker is missing: $marker"
+    grep -Fqx "$DATA_MARKER_SIGNATURE" "$marker" || die "Refusing purge because repository marker has unexpected content: $marker"
+    if [[ $DRY_RUN == true ]]; then
+        render_command rm -rf -- "$resolved"
+        return
+    fi
+    rm -rf -- "$resolved"
+    info "Persistent repository data removed: $resolved"
+}
+
+if [[ ${AIRGAP_REPOSITORY_HOST_LIBRARY_ONLY:-0} == 1 ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
+[[ $# -gt 0 ]] || { usage >&2; exit 2; }
+COMMAND=$1
+shift
+
+while (($#)); do
+    case $1 in
+        --core-versions)
+            shift
+            while (($#)) && [[ $1 != -* ]]; do CORE_VERSIONS+=("$1"); shift; done
+            ((${#CORE_VERSIONS[@]} > 0)) || die "--core-versions requires at least one value"
+            ;;
+        --core-os)
+            shift
+            while (($#)) && [[ $1 != -* ]]; do CORE_OS+=("$1"); shift; done
+            ((${#CORE_OS[@]} > 0)) || die "--core-os requires at least one value"
+            ;;
+        --mep-versions)
+            shift
+            while (($#)) && [[ $1 != -* ]]; do MEP_VERSIONS+=("$1"); shift; done
+            ((${#MEP_VERSIONS[@]} > 0)) || die "--mep-versions requires at least one value"
+            ;;
+        --mep-os)
+            shift
+            while (($#)) && [[ $1 != -* ]]; do MEP_OS+=("$1"); shift; done
+            ((${#MEP_OS[@]} > 0)) || die "--mep-os requires at least one value"
+            ;;
+        --installer-os)
+            shift
+            while (($#)) && [[ $1 != -* ]]; do INSTALLER_OS+=("$1"); shift; done
+            ((${#INSTALLER_OS[@]} > 0)) || die "--installer-os requires at least one value"
+            ;;
+        --df-version|--mep-version|--os|-i|--installer)
+            die "Legacy option '$1' was removed; use component-specific --core-* / --mep-* / --installer-os options"
+            ;;
+        --credentials-file)
+            die "--credentials-file is no longer supported; use --repo-config-file, --repo-url-stdin, or --repo-url-file for repository authentication"
+            ;;
+        --repo-url) require_value "$@"; REPO_URL=${2%/}; shift 2 ;;
+        --repo-url-file) require_value "$@"; REPO_URL_FILE=$2; shift 2 ;;
+        --repo-config-file) require_value "$@"; REPO_CONFIG_FILE=$2; shift 2 ;;
+        --repo-url-stdin) REPO_URL_STDIN=true; shift ;;
+        --port) require_value "$@"; PORT=$2; PORT_SET=true; shift 2 ;;
+        --data-dir) require_value "$@"; DATA_DIR=$2; DATA_DIR_SET=true; shift 2 ;;
+        --container-name) require_value "$@"; CONTAINER_NAME=$2; shift 2 ;;
+        --image) require_value "$@"; IMAGE=$2; IMAGE_SET=true; shift 2 ;;
+        --advertise-host) require_value "$@"; ADVERTISE_HOST=$2; shift 2 ;;
+        --runtime) require_value "$@"; RUNTIME=$2; shift 2 ;;
+        --http-proxy) require_value "$@"; HTTP_PROXY_VALUE=$2; HTTP_PROXY_SET=true; shift 2 ;;
+        --https-proxy) require_value "$@"; HTTPS_PROXY_VALUE=$2; HTTPS_PROXY_SET=true; shift 2 ;;
+        --no-proxy) require_value "$@"; NO_PROXY_VALUE=$2; NO_PROXY_SET=true; shift 2 ;;
+        --network-config-file) require_value "$@"; NETWORK_CONFIG_FILE=$2; shift 2 ;;
+        --ca-cert) require_value "$@"; CA_CERT=$2; shift 2 ;;
+        --mapr-setup-file) require_value "$@"; MAPR_SETUP_FILE=$2; shift 2 ;;
+        --mapr-setup-url) require_value "$@"; MAPR_SETUP_URL=$2; shift 2 ;;
+        --mapr-setup-sha256) require_value "$@"; MAPR_SETUP_SHA256=$2; shift 2 ;;
+        --skip-disk-space-check) SKIP_DISK_SPACE_CHECK=true; shift ;;
+        --unsafe-log-raw-argv) UNSAFE_LOG_RAW_ARGV=true; shift ;;
+        --acknowledge-secret-exposure) ACKNOWLEDGE_SECRET_EXPOSURE=true; shift ;;
+        --mapr-setup-path|--mapr-setup-source)
+            die "Legacy option '$1' was removed; use --mapr-setup-file for a sync-time development override"
+            ;;
+        --build) BUILD_IMAGE=true; LOCAL_IMAGE=true; shift ;;
+        --local) LOCAL_IMAGE=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
+        --yes) ASSUME_YES=true; shift ;;
+        -h|--help) concise_command_usage "$COMMAND"; exit 0 ;;
+        --help-full)
+            case $COMMAND in
+                build|push|create|update|start|stop|restart|status|print-url|remove|purge-data)
+                    command_usage "$COMMAND"; exit 0 ;;
+                *) die "Unknown option '$1'" ;;
+            esac
+            ;;
+        *) die "Unknown option '$1'" ;;
+    esac
+done
+
+case $COMMAND in
+    build|push)
+        [[ -z $REPO_URL && -z $REPO_URL_FILE && -z $REPO_CONFIG_FILE && $REPO_URL_STDIN == false && \
+           -z $MAPR_SETUP_FILE && -z $MAPR_SETUP_URL && -z $MAPR_SETUP_SHA256 && \
+           $SKIP_DISK_SPACE_CHECK == false && $UNSAFE_LOG_RAW_ARGV == false && \
+           $ACKNOWLEDGE_SECRET_EXPOSURE == false ]] || \
+            die "Repository, downloader, disk-space, and unsafe argv options apply to create/update, not to image build/push"
+        validate_name
+        detect_runtime
+        if [[ $COMMAND == build ]]; then
+            build_image_command
+        else
+            push_image_command
+        fi
+        ;;
+    create) create_container ;;
+    update) update_container ;;
+    start) reject_downloader_options_for_serving_command; start_container ;;
+    stop) reject_downloader_options_for_serving_command; stop_container ;;
+    restart) reject_downloader_options_for_serving_command; restart_container ;;
+    status) reject_downloader_options_for_serving_command; status_container ;;
+    print-url) reject_downloader_options_for_serving_command; print_container_url ;;
+    remove) reject_downloader_options_for_serving_command; remove_container ;;
+    purge-data) reject_downloader_options_for_serving_command; purge_data ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "Unknown command '$COMMAND'" ;;
+esac
