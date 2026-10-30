@@ -18,7 +18,6 @@ usage()
    echo "-p|--publicipv4dns is the public IPv4 DNS and needed for cloud-deployed seed nodes. Note that both inbound and outbound traffic on port 8443
          needs to be enabled on the cloud instance. Otherwise, the Data Fabric UI cannot be accessed"
    echo "-f|--proxyfiledetails is the location of the file from where proxy details provided by the user are copied to the docker container."
-   echo "-r|--repo_url is optional, if set it will be passed to mapr-setup.sh inside the container as: mapr-setup.sh -R REPO_URL -y"
    echo "-l|--local use a locally built image, skip docker pull"
    echo "--legacy-docker-install use the manual Ubuntu Docker APT installation path"
    echo
@@ -846,6 +845,12 @@ hostName="${hostName:-"edf-installer.hpe.com"}"
 clusterName=$(echo ${hostName} | cut -d '.' -f 1)
 shortHostName=$(echo $hostName | awk -F '.' '{print $1}')
 
+# Seed image is amd64-only; Apple Silicon Macs must emulate it.
+PLATFORM_OPT=""
+if [ "$(uname -s)" == "Darwin" ] && [ "$(uname -m)" == "arm64" ]; then
+    PLATFORM_OPT="--platform linux/amd64"
+fi
+
 
 runMaprImage() {
     echo "Please enter the local sudo password for $(whoami)"
@@ -895,6 +900,7 @@ runMaprImage() {
         REPO_URL="${REPO_URL:-}"
 
         $container_engine run -d --privileged \
+          $PLATFORM_OPT \
           -v /tmp/maprdemo/zkdata:/opt/mapr/zkdata \
           -v /tmp/maprdemo/pid:/opt/mapr/pid \
           -v /tmp/maprdemo/logs:/opt/mapr/logs \
@@ -945,7 +951,9 @@ runMaprImage() {
 
         runMaprImage
 
-        sudo sed -i  '/'${hostName}'/d' /etc/hosts &>/dev/null
+        if [ "$os_vers" != "Darwin" ]; then
+            sudo sed -i  '/'${hostName}'/d' /etc/hosts &>/dev/null
+        fi
 
         os_vers=`uname -s` > /dev/null 2>&1
 
@@ -989,12 +997,13 @@ runMaprImage() {
 
         set_noproxy || exit 1
         services_up=0
-        sleep_total=600
+        sleep_total=900
         sleep_counter=0
         if [ "$os_vers" == "Darwin" ]; then
            while [[ $sleep_counter -le $sleep_total ]]
             do
-             curl -k -X GET "https://edf-installer.hpe.com:8443/rest/node/list?columns=svc" -u mapr:mapr123 &>/dev/null
+             # --resolve avoids needing an /etc/hosts entry (sudo edits may be blocked on managed Macs).
+             curl -k --resolve "${hostName}:8443:127.0.0.1" -X GET "https://${hostName}:8443/rest/node/list?columns=svc" -u mapr:mapr123 &>/dev/null
              if [ $? -ne 0 ];then
                 echo "Services required for HPE Data Fabric are coming up"
                 sleep 60;
