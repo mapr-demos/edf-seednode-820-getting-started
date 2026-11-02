@@ -34,7 +34,7 @@ Use the following steps to bring up the container image and launch the Create Fa
 
 ### Documentation Link
 
-For user documentation, see https://docs.ezmeral.hpe.com/datafabric/home/installation/installation_main.html
+For user documentation, see https://docs.ezmeral.hpe.com/datafabric-customer-managed/82/SeedInstallation/seed_node_deployment.html
 
 ---
 
